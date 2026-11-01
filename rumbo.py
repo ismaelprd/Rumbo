@@ -1349,10 +1349,8 @@ def main(page: ft.Page):
     page.run_task(ticker)
 
 
-   if __name__ == "__main__":
-       ft.app(
-           target=main,
-           view=ft.AppView.WEB_BROWSER,
-           host="0.0.0.0",
-           port=int(os.getenv("PORT", 8000)),
-       )
+if __name__ == "__main__":
+    if os.getenv("PORT"):  # en Render: modo web
+        ft.app(target=main, view=ft.AppView.WEB_BROWSER, host="0.0.0.0", port=int(os.getenv("PORT")))
+    else:  # en tu PC: ventana normal
+        ft.app(target=main)
