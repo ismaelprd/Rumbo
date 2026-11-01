@@ -118,6 +118,18 @@ CREATE TABLE IF NOT EXISTS rewards (n INTEGER PRIMARY KEY, mission TEXT, reward 
 
 FMT = "%Y-%m-%d %H:%M"
 
+# Hora local: en Render el servidor va en UTC, así que se usa la zona de aquí.
+# En el móvil / PC se usa la hora del propio dispositivo.
+try:
+    from zoneinfo import ZoneInfo
+    _TZ = ZoneInfo(os.getenv("APP_TZ", "Europe/Madrid")) if (os.getenv("PORT") or os.getenv("APP_TZ")) else None
+except Exception:
+    _TZ = None
+
+
+def local_now():
+    return datetime.now(_TZ).replace(tzinfo=None) if _TZ else datetime.now()
+
 
 # ----------------------------------------------------------------------------
 # Base de datos
@@ -184,7 +196,7 @@ class DB:
 
     def record_seconds(self):
         best = 0.0
-        now = datetime.now()
+        now = local_now()
         for r in self.all_streaks():
             s = datetime.fromisoformat(r["start_ts"])
             e = datetime.fromisoformat(r["end_ts"]) if r["end_ts"] else now
@@ -192,7 +204,7 @@ class DB:
         return best
 
     def total_clean_days(self):
-        now = datetime.now()
+        now = local_now()
         tot = 0.0
         for r in self.all_streaks():
             s = datetime.fromisoformat(r["start_ts"])
@@ -211,17 +223,17 @@ class DB:
         return r[0]["m"] or 0
 
     def add_score(self, game, score):
-        self.x("INSERT INTO scores(game,score,ts) VALUES(?,?,?)", (game, score, datetime.now().isoformat()))
+        self.x("INSERT INTO scores(game,score,ts) VALUES(?,?,?)", (game, score, local_now().isoformat()))
 
     def chests(self):
         return {r["n"]: r for r in self.q("SELECT * FROM rewards")}
 
     def open_chest(self, n, mission, reward):
         self.x("INSERT OR IGNORE INTO rewards(n,mission,reward,opened_ts) VALUES(?,?,?,?)",
-               (n, mission, reward, datetime.now().isoformat()))
+               (n, mission, reward, local_now().isoformat()))
 
     def finish_chest(self, n):
-        self.x("UPDATE rewards SET done_ts=? WHERE n=?", (datetime.now().isoformat(), n))
+        self.x("UPDATE rewards SET done_ts=? WHERE n=?", (local_now().isoformat(), n))
 
     def notes(self, kind):
         return self.q("SELECT * FROM notes WHERE kind=? ORDER BY id DESC", (kind,))
@@ -231,12 +243,25 @@ class DB:
             self.x(f"DELETE FROM {t}")
 
 
+_DB = None
+_DB_LOCK = threading.Lock()
+
+
+def get_db():
+    """Una sola conexión compartida (antes se abría y sincronizaba con Turso en cada visita)."""
+    global _DB
+    with _DB_LOCK:
+        if _DB is None:
+            _DB = DB(DB_PATH)
+        return _DB
+
+
 # ----------------------------------------------------------------------------
 # Utilidades
 # ----------------------------------------------------------------------------
 def parse_dt(text):
     dt = datetime.strptime(text.strip(), FMT)
-    if dt > datetime.now() + timedelta(minutes=1):
+    if dt > local_now() + timedelta(minutes=1):
         raise ValueError("future")
     return dt
 
@@ -264,7 +289,7 @@ def risk_info(db):
     for r in db.q("SELECT ts FROM events"):
         hist[datetime.fromisoformat(r["ts"]).hour] += 1
     total = sum(hist)
-    now = datetime.now()
+    now = local_now()
     score, why = 0, []
     if total >= 3:
         window = sum(hist[(now.hour + i) % 24] for i in range(3))
@@ -371,7 +396,7 @@ def dialog(title_text, content, actions):
 # App
 # ----------------------------------------------------------------------------
 def main(page: ft.Page):
-    db = DB(DB_PATH)
+    db = get_db()
     page.title = APP_NAME
     page.theme_mode = ft.ThemeMode.DARK
     page.theme = ft.Theme(color_scheme_seed=B2)
@@ -404,7 +429,7 @@ def main(page: ft.Page):
 
     # ---- diálogos ---------------------------------------------------------
     def relapse_dialog(e=None):
-        when = tf("Cuándo (AAAA-MM-DD HH:MM)", value=datetime.now().strftime(FMT))
+        when = tf("Cuándo (AAAA-MM-DD HH:MM)", value=local_now().strftime(FMT))
         trig = dd("¿Qué lo disparó?", TRIGGERS)
         note = tf("Nota (opcional)", multiline=True, min_lines=2, max_lines=4)
         err = ft.Text("", color=DANGER)
@@ -431,7 +456,7 @@ def main(page: ft.Page):
         open_dlg(dlg)
 
     def start_date_dialog(first_time=False):
-        when = tf("Inicio de la racha (AAAA-MM-DD HH:MM)", value=datetime.now().strftime(FMT))
+        when = tf("Inicio de la racha (AAAA-MM-DD HH:MM)", value=local_now().strftime(FMT))
         err = ft.Text("", color=DANGER)
 
         def save(_):
@@ -456,7 +481,7 @@ def main(page: ft.Page):
         trig = dd("¿Qué provocó las ganas?", TRIGGERS)
 
         def save(_):
-            db.add_event(datetime.now(), "urge", trig.value, None)
+            db.add_event(local_now(), "urge", trig.value, None)
             close_dlg(dlg)
             snack("Ganas superadas. Eso es entrenamiento real.")
             go("main", 0)
@@ -488,7 +513,7 @@ def main(page: ft.Page):
             muted("Una app privada para llevar la cuenta de tu racha y ayudarte cuando lleguen las ganas.", 15),
             ft.Container(height=20),
             gbtn("Empezar mi racha", ft.Icons.PLAY_ARROW, on_click=lambda e: start_date_dialog(True), height=56),
-            ft.TextButton("Empiezo ahora mismo", on_click=lambda e: (db.start_streak(datetime.now()), render())),
+            ft.TextButton("Empiezo ahora mismo", on_click=lambda e: (db.start_streak(local_now()), render())),
         ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=12, scroll=ft.ScrollMode.AUTO))
 
     # ---- cofres de 10 días -------------------------------------------------
@@ -566,7 +591,7 @@ def main(page: ft.Page):
         if not cur:
             return onboarding_view()
         start = datetime.fromisoformat(cur["start_ts"])
-        secs = (datetime.now() - start).total_seconds()
+        secs = (local_now() - start).total_seconds()
         d, h, m, s = split_duration(secs)
         days_f = secs / 86400
         nxt = next(((n, name) for n, name in MILESTONES if n > days_f), None)
@@ -629,7 +654,7 @@ def main(page: ft.Page):
 
     def progress_view():
         cur = db.current_streak()
-        secs = (datetime.now() - datetime.fromisoformat(cur["start_ts"])).total_seconds() if cur else 0
+        secs = (local_now() - datetime.fromisoformat(cur["start_ts"])).total_seconds() if cur else 0
         days_f = secs / 86400
         record = max(db.record_seconds(), secs)
 
@@ -700,7 +725,7 @@ def main(page: ft.Page):
             ft.Row([
                 ft.Text(datetime.fromisoformat(r["start_ts"]).strftime("%d/%m/%y %H:%M"), size=13, color=TXT,
                         expand=True),
-                ft.Text(human(((datetime.fromisoformat(r["end_ts"]) if r["end_ts"] else datetime.now())
+                ft.Text(human(((datetime.fromisoformat(r["end_ts"]) if r["end_ts"] else local_now())
                                - datetime.fromisoformat(r["start_ts"])).total_seconds()), size=13, color=B1),
             ]) for r in db.all_streaks()[:8]], spacing=8))
 
@@ -710,7 +735,7 @@ def main(page: ft.Page):
         ], spacing=16, scroll=ft.ScrollMode.AUTO))
 
     def diary_view():
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = local_now().strftime("%Y-%m-%d")
         ci = db.q("SELECT * FROM checkins WHERE day=?", (today,))
 
         def slider(**kw):
@@ -1332,7 +1357,7 @@ def main(page: ft.Page):
             await asyncio.sleep(1)
             try:
                 if state["screen"] == "main" and state["tab"] == 0 and "days" in refs and not state["locked"]:
-                    secs = (datetime.now() - refs["start"]).total_seconds()
+                    secs = (local_now() - refs["start"]).total_seconds()
                     d, h, m, s = split_duration(secs)
                     refs["days"].value = str(d)
                     refs["hms"].value = f"{h:02d}h {m:02d}m {s:02d}s"
@@ -1350,6 +1375,7 @@ def main(page: ft.Page):
 
 
 if __name__ == "__main__":
+    get_db()
     if os.getenv("PORT"):  # en Render: modo web
         ft.app(target=main, view=ft.AppView.WEB_BROWSER, host="0.0.0.0", port=int(os.getenv("PORT")))
     else:  # en tu PC: ventana normal
