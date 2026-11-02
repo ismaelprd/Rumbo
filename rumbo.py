@@ -1,26 +1,29 @@
 """
-Rumbo - tu racha, tu control.   (v2: interfaz neumórfica + runner infinito)
+Rumbo - tu racha, tu control.   (v3: retos con Gemini + cofres épicos)
 
 App discreta para dejar un hábito: contador de racha, registro de recaídas,
-botón SOS (runner arcade, respiración, ola de ganas), radar de riesgo y plan personal.
+botón «Tengo ganas» (reto anti-ganas generado con Gemini), radar de riesgo y plan personal.
 
-Flet 0.28.3  ·  SQLite local  ·  sin conexión a internet
+Flet 0.28.3  ·  SQLite local o Turso
+Variable de entorno para los retos: GEMINI_API_KEY (sin ella se usan retos de reserva)
     pip install flet==0.28.3 flet-desktop==0.28.3
     python main.py            (probar en PC)
     flet build apk            (generar APK)
 """
 import asyncio
 import hashlib
-import math
+import json
 import os
 import random
 import sqlite3
+import re
 import threading
-import time
+import unicodedata
+import urllib.error
+import urllib.request
 from datetime import datetime, timedelta
 
 import flet as ft
-import flet.canvas as fcv
 
 try:  # solo hace falta en Render (Turso); en el APK / PC se usa SQLite local
     import libsql
@@ -79,25 +82,104 @@ MESSAGES = [
     "Un impulso dura minutos; tu racha son días.",
     "Si hoy es difícil, es porque estás cambiando algo importante.",
 ]
-CHEST_EVERY = 10  # un cofre cada 10 días limpios acumulados
-MISSIONS = [
-    "Sal a caminar 30 minutos sin el móvil",
-    "Escribe 3 cosas que han mejorado desde que empezaste",
-    "Haz 20 minutos de ejercicio",
-    "Ordena un rincón de tu casa o de tu habitación",
-    "Escribe a alguien que aprecias y propón un plan",
-    "Cocina algo que te guste de verdad",
-    "Dedica 30 minutos a aprender algo que te interese",
-    "Pasa una tarde fuera de casa haciendo un plan distinto",
-]
-REWARDS = [
-    "Date un capricho: tu comida favorita",
-    "Una tarde libre para ti: peli, serie o juego sin culpa",
-    "Compra algo pequeño que llevas tiempo queriendo",
-    "Un café o un postre en tu sitio favorito",
-    "Una noche larga de sueño, sin alarma",
-    "Un plan con amigos, y lo eliges tú",
-]
+CHEST_EVERY = 10  # un cofre cada 10 días de la RACHA ACTUAL
+
+# Rarezas de los cofres: cuanto más lejos llegas en una racha, mejores son.
+RARITIES = ["Común", "Rara", "Épica", "Legendaria"]
+RARITY_COLOR = {"Común": "#A9B4CC", "Rara": B1, "Épica": "#C084FC", "Legendaria": "#FFC53D"}
+RARITY_GRAD = {"Común": ("#9AA7C2", "#5B6780"), "Rara": ("#58A6FF", "#2F6BFF"),
+               "Épica": ("#D8A6FF", "#7C3AED"), "Legendaria": ("#FFE08A", "#F59E0B")}
+
+MISSIONS = {
+    "Común": [
+        "Sal a caminar 30 minutos sin el móvil",
+        "Escribe 3 cosas que han mejorado desde que empezaste",
+        "Haz 20 minutos de ejercicio",
+        "Ordena un rincón de tu casa o de tu habitación",
+        "Escribe a alguien que aprecias y propón un plan",
+        "Dedica 30 minutos a aprender algo que te interese",
+    ],
+    "Rara": [
+        "Cocina algo que te guste de verdad, desde cero",
+        "Haz 40 minutos de ejercicio y estira 10 minutos después",
+        "Pasa una tarde fuera de casa haciendo un plan distinto",
+        "Llama de voz a alguien con quien llevas tiempo sin hablar",
+        "Ordena a fondo una habitación entera",
+        "Aprende algo nuevo durante 1 hora y explícaselo a alguien",
+    ],
+    "Épica": [
+        "Haz una ruta a pie o en bici de más de una hora, sin auriculares",
+        "Pasa 2 horas sin móvil haciendo algo creativo o manual",
+        "Escribe una carta a tu yo de dentro de un año: cómo estás y qué quieres",
+        "Haz algo que te dé un poco de miedo o vergüenza (clase de prueba, hablar con alguien nuevo...)",
+        "Prepara una comida y compártela con alguien",
+    ],
+    "Legendaria": [
+        "Planifica y haz una salida de medio día a un sitio en el que nunca hayas estado",
+        "Dedica una mañana entera a un proyecto personal que llevas tiempo aplazando",
+        "Haz un reto físico personal: tu mejor marca en algo (km, flexiones, plancha...)",
+        "Escribe una página entera: qué ha cambiado en ti y qué vas a hacer con ello",
+    ],
+}
+REWARDS = {
+    "Común": [
+        "Date un capricho: tu comida favorita",
+        "Un café o un postre en tu sitio favorito",
+        "Una hora de serie o juego sin culpa",
+        "Una ducha larga con tu música a todo volumen",
+        "Compra algo pequeño que llevas tiempo queriendo (hasta 10 €)",
+        "Un helado enorme, sin medir",
+    ],
+    "Rara": [
+        "Una tarde libre para ti: peli, serie o juego sin culpa",
+        "Pide la cena de tu sitio favorito, y la eliges tú",
+        "Una noche larga de sueño, sin alarma",
+        "Un plan con amigos, y lo eliges tú",
+        "Compra algo que llevas tiempo queriendo (hasta 25 €)",
+        "Un masaje o una sesión de relax, en casa o en un centro",
+    ],
+    "Épica": [
+        "Cena en el restaurante que más ganas tengas",
+        "Un día entero sin obligaciones evitables: solo lo que te apetezca",
+        "Cómprate ese juego, ropa o gadget que tanto miras (hasta 50 €)",
+        "Entradas para un concierto, cine, evento o partido que te guste",
+        "Una escapada de un día a un sitio nuevo",
+    ],
+    "Legendaria": [
+        "Un finde de escapada: tú eliges destino",
+        "Ese capricho grande que llevas meses mirando (hasta 100 €)",
+        "Una experiencia para recordar: karts, escape room, parapente, spa...",
+        "Un día entero en el que decides TODO tú, de la mañana a la noche",
+        "Un viaje o plan soñado: ponle fecha hoy mismo",
+    ],
+}
+BONUS = {
+    "Épica": ["Bonus épico: elige también el plan del domingo",
+              "Bonus épico: hoy no friegas ni cocinas",
+              "Bonus épico: una hora extra de lo que más te guste"],
+    "Legendaria": ["Bonus legendario: un capricho extra que puedes canjear cuando quieras",
+                   "Bonus legendario: pídele a alguien que te prepare una comida",
+                   "Bonus legendario: un día entero de «hoy mando yo»"],
+}
+BADGES = {
+    "Común": ["Chispa", "Brújula", "Ancla", "Semilla", "Primer paso"],
+    "Rara": ["Faro", "Halcón", "Lobo solitario", "Roble", "Centinela"],
+    "Épica": ["Titán", "Fénix", "Dragón de escarcha", "Coloso", "Tormenta"],
+    "Legendaria": ["Leyenda viva", "Amo del Rumbo", "Inquebrantable", "Sol naciente", "Rey de la montaña"],
+}
+
+
+def roll_rarity(n):
+    """n = número de cofre dentro de la racha. Cada cofre seguido mejora las probabilidades;
+    el 5.º, 15.º... es como mínimo Épico y el 10.º, 20.º... es siempre Legendario."""
+    if n % 10 == 0:
+        return "Legendaria"
+    if n % 5 == 0:
+        return random.choices(["Épica", "Legendaria"], [75, 25])[0]
+    k = min(n - 1, 8)
+    return random.choices(RARITIES, [max(10, 50 - 5 * k), 30, 15 + 2 * k, 5 + 2 * k])[0]
+
+
 URGE_PLAN = [
     "Levántate y cambia de habitación ahora mismo",
     "Deja el móvil fuera de la cama / del baño",
@@ -114,6 +196,8 @@ CREATE TABLE IF NOT EXISTS checkins (day TEXT PRIMARY KEY, mood INTEGER, stress 
 CREATE TABLE IF NOT EXISTS scores (id INTEGER PRIMARY KEY AUTOINCREMENT, game TEXT, score INTEGER, ts TEXT);
 CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, text TEXT);
 CREATE TABLE IF NOT EXISTS rewards (n INTEGER PRIMARY KEY, mission TEXT, reward TEXT, opened_ts TEXT, done_ts TEXT);
+CREATE TABLE IF NOT EXISTS chests (id INTEGER PRIMARY KEY AUTOINCREMENT, streak_id INTEGER NOT NULL, n INTEGER NOT NULL, mission TEXT, reward TEXT, rarity TEXT, badge TEXT, opened_ts TEXT, done_ts TEXT, UNIQUE(streak_id, n));
+CREATE TABLE IF NOT EXISTS retos (id INTEGER PRIMARY KEY AUTOINCREMENT, texto TEXT NOT NULL, tipo TEXT, ts TEXT, done_ts TEXT);
 """
 
 FMT = "%Y-%m-%d %H:%M"
@@ -148,6 +232,7 @@ class DB:
             if stmt.strip():
                 self.c.execute(stmt)
         self.c.commit()
+        self._migrate()
 
     def q(self, sql, args=()):
         with self.lock:
@@ -218,28 +303,57 @@ class DB:
     def count_events(self, kind):
         return self.q("SELECT COUNT(*) n FROM events WHERE kind=?", (kind,))[0]["n"]
 
-    def best_score(self, game):
-        r = self.q("SELECT MAX(score) m FROM scores WHERE game=?", (game,))
-        return r[0]["m"] or 0
+    # --- retos anti-ganas ---
+    def add_reto(self, texto, tipo):
+        self.x("INSERT INTO retos(texto,tipo,ts) VALUES(?,?,?)", (texto, tipo, local_now().isoformat()))
+        return self.q("SELECT id FROM retos ORDER BY id DESC LIMIT 1")[0]["id"]
 
-    def add_score(self, game, score):
-        self.x("INSERT INTO scores(game,score,ts) VALUES(?,?,?)", (game, score, local_now().isoformat()))
+    def finish_reto(self, rid):
+        self.x("UPDATE retos SET done_ts=? WHERE id=?", (local_now().isoformat(), rid))
 
-    def chests(self):
-        return {r["n"]: r for r in self.q("SELECT * FROM rewards")}
+    def recent_retos(self, n=300):
+        return [r["texto"] for r in self.q("SELECT texto FROM retos ORDER BY id DESC LIMIT ?", (n,))]
 
-    def open_chest(self, n, mission, reward):
-        self.x("INSERT OR IGNORE INTO rewards(n,mission,reward,opened_ts) VALUES(?,?,?,?)",
-               (n, mission, reward, local_now().isoformat()))
+    def count_retos_done(self):
+        return self.q("SELECT COUNT(*) n FROM retos WHERE done_ts IS NOT NULL")[0]["n"]
 
-    def finish_chest(self, n):
-        self.x("UPDATE rewards SET done_ts=? WHERE n=?", (local_now().isoformat(), n))
+    # --- cofres: cuelgan de la racha en la que se ganan ---
+    def chest_rows(self):
+        return self.q("SELECT * FROM chests ORDER BY streak_id, n")
+
+    def open_chest(self, sid, n, mission, reward, rarity, badge):
+        ts = local_now().isoformat()
+        if self.q("SELECT 1 x FROM chests WHERE streak_id=? AND n=?", (sid, n)):
+            self.x("UPDATE chests SET mission=?, reward=?, rarity=?, badge=?, opened_ts=? "
+                   "WHERE streak_id=? AND n=? AND opened_ts IS NULL", (mission, reward, rarity, badge, ts, sid, n))
+        else:
+            self.x("INSERT INTO chests(streak_id,n,mission,reward,rarity,badge,opened_ts) VALUES(?,?,?,?,?,?,?)",
+                   (sid, n, mission, reward, rarity, badge, ts))
+
+    def finish_chest(self, sid, n):
+        self.x("UPDATE chests SET done_ts=? WHERE streak_id=? AND n=?", (local_now().isoformat(), sid, n))
+
+    def bank_chests(self, sid, start, end):
+        """Al recaer, los cofres ya ganados en esa racha se guardan para que no se pierdan."""
+        earned = int((end - start).total_seconds() // 86400) // CHEST_EVERY
+        for n in range(1, earned + 1):
+            self.x("INSERT OR IGNORE INTO chests(streak_id,n) VALUES(?,?)", (sid, n))
+
+    def _migrate(self):
+        """Los cofres antiguos (contaban días acumulados) pasan a la tabla nueva como 'racha 0'."""
+        if self.get("chests_v2"):
+            return
+        for r in self.q("SELECT * FROM rewards ORDER BY n"):
+            self.x("INSERT OR IGNORE INTO chests(streak_id,n,mission,reward,rarity,badge,opened_ts,done_ts) "
+                   "VALUES(0,?,?,?,?,?,?,?)",
+                   (r["n"], r["mission"], r["reward"], "Común", "Cofre clásico", r["opened_ts"], r["done_ts"]))
+        self.set("chests_v2", "1")
 
     def notes(self, kind):
         return self.q("SELECT * FROM notes WHERE kind=? ORDER BY id DESC", (kind,))
 
     def wipe(self):
-        for t in ("settings", "streaks", "events", "checkins", "scores", "notes", "rewards"):
+        for t in ("settings", "streaks", "events", "checkins", "scores", "notes", "rewards", "chests", "retos"):
             self.x(f"DELETE FROM {t}")
 
 
@@ -311,6 +425,144 @@ def risk_info(db):
     level = "Bajo" if score < 35 else ("Medio" if score < 65 else "Alto")
     color = OK if score < 35 else (WARN if score < 65 else DANGER)
     return score, level, color, hist, why
+
+
+# ----------------------------------------------------------------------------
+# Retos anti-ganas generados con Gemini (solo librería estándar: sin dependencias nuevas)
+# La clave va en la variable de entorno GEMINI_API_KEY. NUNCA la escribas en el código.
+# ----------------------------------------------------------------------------
+GEMINI_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip()
+_GEMINI_RUTA = 0  # recuerda qué endpoint funcionó la última vez
+
+RETO_TIPOS = [
+    ("Cuerpo", "algo físico y sencillo: moverse, beber agua, estirar, lavarse la cara, respirar..."),
+    ("Mente", "un reto mental: listar cosas, memorizar, cálculo, adivinanzas, palabras (por ejemplo, citar 10 científicos)"),
+    ("Social", "escribir o llamar a alguien con un propósito concreto (por ejemplo, preguntarle a un amigo cómo está)"),
+    ("Opinión", "pensar y formarse una opinión argumentada sobre un tema controvertido (no político partidista) y defenderla en voz alta"),
+    ("Creatividad", "inventar, dibujar, escribir o imaginar algo en pocos minutos"),
+    ("Orden", "ordenar o limpiar algo concreto y pequeño"),
+    ("Aprender", "aprender o recordar algo útil o curioso de ciencia, idiomas, historia, geografía..."),
+]
+
+RETOS_RESERVA = [
+    "Ve a la cocina y bebe dos vasos de agua despacio, mirando por la ventana.",
+    "Cita 10 científicos de memoria. Si te atascas, sigue con 10 escritores.",
+    "Escríbele a un amigo y pregúntale cómo está. Cuéntale algo bueno de tu día.",
+    "Elige un tema polémico y defiende en voz alta, durante 2 minutos, la postura contraria a la tuya.",
+    "Nombra 15 países y sus capitales sin mirar nada.",
+    "Haz 3 series de 15 sentadillas con 30 segundos de descanso.",
+    "Ordena durante 10 minutos el cajón o el estante más desastroso que tengas.",
+    "Dibuja con lápiz y papel tu habitación ideal. Tienes 5 minutos.",
+    "Escribe 10 cosas por las que estás agradecido hoy.",
+    "Lávate la cara con agua fría y haz 2 minutos de estiramientos de cuello y hombros.",
+    "Cuenta hacia atrás de 7 en 7 desde 200 sin equivocarte.",
+    "Prepárate un té o una infusión y tómatela sentado, sin pantallas.",
+    "Piensa en una película que te encante y escribe en 5 líneas por qué recomendarla.",
+    "Llama a alguien de tu familia y pregúntale qué tal está.",
+    "Escribe el abecedario con un animal para cada letra.",
+    "Sal al balcón o a la puerta de casa y cuenta 20 cosas de color verde.",
+    "Aprende a decir 5 frases nuevas en un idioma que te guste y repítelas en voz alta.",
+    "Haz 1 minuto de plancha, descansa y repite 3 veces.",
+]
+
+
+def _norm_txt(t):
+    t = unicodedata.normalize("NFD", str(t).lower())
+    t = "".join(c for c in t if unicodedata.category(c) != "Mn")
+    return re.sub(r"[^a-z0-9 ]+", " ", t)
+
+
+def _clave(t):
+    return {w for w in _norm_txt(t).split() if len(w) > 3}
+
+
+def _repetido(texto, previos):
+    """True si el reto es igual o casi igual (mismas palabras clave) a alguno ya usado."""
+    a = _clave(texto)
+    if not a:
+        return False
+    for p in previos:
+        b = _clave(p)
+        if not b:
+            continue
+        inter = len(a & b)
+        if len(a | b) and (inter / len(a | b) >= 0.5 or (inter >= 3 and inter / min(len(a), len(b)) >= 0.6)):
+            return True
+    return False
+
+
+def _gemini_json(prompt):
+    global _GEMINI_RUTA
+    if not GEMINI_KEY:
+        raise RuntimeError("Falta la variable GEMINI_API_KEY")
+    cuerpo = json.dumps({
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {"responseMimeType": "application/json", "temperature": 1.1},
+    }).encode("utf-8")
+    base = f"models/{GEMINI_MODEL}:generateContent"
+    rutas = [
+        (f"https://generativelanguage.googleapis.com/v1beta/{base}", {"x-goog-api-key": GEMINI_KEY}),
+        (f"https://aiplatform.googleapis.com/v1/publishers/google/{base}?key={GEMINI_KEY}", {}),
+    ]
+    orden = list(range(len(rutas)))
+    orden = orden[_GEMINI_RUTA:] + orden[:_GEMINI_RUTA]
+    ultimo = None
+    for i in orden:
+        url, cab = rutas[i]
+        req = urllib.request.Request(url, data=cuerpo, method="POST",
+                                     headers={"Content-Type": "application/json", **cab})
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                datos = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            ultimo = e
+            if e.code in (400, 401, 403, 404):  # clave de otro tipo de endpoint: prueba el siguiente
+                continue
+            raise
+        _GEMINI_RUTA = i
+        partes = datos["candidates"][0]["content"]["parts"]
+        texto = "".join(p.get("text", "") for p in partes if not p.get("thought"))
+        m = re.search(r"\{.*\}", texto, re.S)
+        return json.loads(m.group(0) if m else texto)
+    raise ultimo or RuntimeError("Gemini no respondió")
+
+
+def generar_reto(db):
+    """Devuelve (texto, tipo, origen). Nunca lanza error; si falla la IA usa un reto de reserva.
+    Los retos ya mostrados se guardan en la base de datos y no se vuelven a repetir."""
+    previos = db.recent_retos(300)
+    h = local_now().hour
+    momento = ("madrugada" if h < 6 else "mañana" if h < 12 else "tarde" if h < 20
+               else "noche" if h < 23 else "madrugada")
+    ya = "\n".join("- " + p[:110] for p in previos[:40]) or "(ninguno todavía)"
+    for _ in range(3):
+        tipo, desc = random.choice(RETO_TIPOS)
+        prompt = f"""Eres el asistente de una app de apoyo para dejar un hábito. La persona acaba de pulsar
+«Tengo ganas» y necesita DISTRAERSE ahora mismo.
+Dale UN reto breve que ocupe su mente o su cuerpo entre 2 y 15 minutos. Sin mencionar el hábito ni nada explícito.
+
+Tipo de reto: {tipo} → {desc}
+Ejemplos del estilo (NO los copies): «Ve a la cocina y bébete dos vasos de agua despacio»; «Cita 10 científicos»;
+«Escríbele a un amigo y pregúntale cómo está»; «Piensa tu opinión sobre un tema controvertido y defiéndela en voz alta».
+
+Reglas:
+- Habla de tú, tono cercano, 1 o 2 frases como máximo. Instrucciones concretas y medibles (cantidad o tiempo).
+- Es de {momento}: de noche o madrugada, nada de salir a la calle ni ejercicio intenso. Sin pantallas si es posible.
+- Sé creativo y evita lo típico.
+- PROHIBIDO repetir o parecerte a estos retos ya usados:
+{ya}
+
+Devuelve ÚNICAMENTE un JSON con la clave "reto"."""
+        try:
+            texto = str(_gemini_json(prompt).get("reto", "")).strip()
+        except Exception as e:
+            print(f"Gemini no disponible: {e}")
+            break
+        if 12 <= len(texto) <= 320 and not _repetido(texto, previos):
+            return texto, tipo, "ia"
+    libres = [r for r in RETOS_RESERVA if not _repetido(r, previos)]
+    return random.choice(libres or RETOS_RESERVA), "Reserva", "reserva"
 
 
 # ----------------------------------------------------------------------------
@@ -441,6 +693,9 @@ def main(page: ft.Page):
                 err.value = "Fecha inválida. Formato: 2026-11-01 21:30 (no puede ser futura)."
                 page.update()
                 return
+            cur = db.current_streak()
+            if cur:
+                db.bank_chests(cur["id"], datetime.fromisoformat(cur["start_ts"]), dt)
             db.end_streak(dt)
             db.add_event(dt, "relapse", trig.value, note.value)
             db.start_streak(dt)
@@ -516,74 +771,141 @@ def main(page: ft.Page):
             ft.TextButton("Empiezo ahora mismo", on_click=lambda e: (db.start_streak(local_now()), render())),
         ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=12, scroll=ft.ScrollMode.AUTO))
 
-    # ---- cofres de 10 días -------------------------------------------------
+    # ---- cofres de 10 días (cuelgan de la RACHA ACTUAL) -------------------------
     def chest_status():
-        total = db.total_clean_days()
-        earned = total // CHEST_EVERY
-        rows = db.chests()
-        for n in range(1, earned + 1):
-            r = rows.get(n)
-            if r is None:
-                return "ready", n, None, total
+        """Estado del cofre según el tiempo de la racha actual, no los días acumulados de rachas pasadas."""
+        cur = db.current_streak()
+        rows = db.chest_rows()
+        days_f, sid = 0.0, None
+        if cur:
+            sid = cur["id"]
+            days_f = (local_now() - datetime.fromisoformat(cur["start_ts"])).total_seconds() / 86400
+        days = int(days_f)
+        # 1) cofres pendientes: ganados sin abrir o con misión sin cumplir (incluso de rachas pasadas)
+        for r in rows:
             if not r["done_ts"]:
-                return "active", n, r, total
-        return "wait", earned + 1, None, total
+                return {"kind": "active" if r["opened_ts"] else "ready", "n": r["n"],
+                        "sid": r["streak_id"], "row": r, "days": days, "days_f": days_f}
+        # 2) cofres ya alcanzados en la racha actual que aún no se han abierto
+        earned = days // CHEST_EVERY
+        have = {r["n"] for r in rows if r["streak_id"] == sid}
+        for n in range(1, earned + 1):
+            if n not in have:
+                return {"kind": "ready", "n": n, "sid": sid, "row": None, "days": days, "days_f": days_f}
+        return {"kind": "wait", "n": earned + 1, "sid": sid, "row": None, "days": days, "days_f": days_f}
 
-    def open_chest(n):
-        mission = random.choice(MISSIONS)
+    def chest_banner(rar, sub=""):
+        g1, g2 = RARITY_GRAD[rar]
+        stars = ft.Row([ft.Icon(ft.Icons.AUTO_AWESOME, color="white", size=22) for _ in range(RARITIES.index(rar) + 1)],
+                       alignment=ft.MainAxisAlignment.CENTER, spacing=2)
+        lines = [stars, ft.Text(f"COFRE {rar.upper()}", size=24, weight=ft.FontWeight.BOLD, color="white",
+                                text_align=ft.TextAlign.CENTER)]
+        if sub:
+            lines.append(ft.Text(sub, size=13, color="#F0F4FF", text_align=ft.TextAlign.CENTER))
+        return ft.Container(
+            content=ft.Column(lines, horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=4),
+            gradient=ft.LinearGradient(begin=ft.alignment.top_left, end=ft.alignment.bottom_right, colors=[g1, g2]),
+            border_radius=20, padding=16, alignment=ft.alignment.center,
+            shadow=[ft.BoxShadow(blur_radius=34, color="#88" + RARITY_COLOR[rar][1:], offset=ft.Offset(0, 8))])
+
+    def play_chest(title_text, rar, sub, reveal, btn_label):
+        """Cofre que tiembla y crece, y estalla revelando su rareza."""
+        g1, g2 = RARITY_GRAD[rar]
+        box = ft.Container(
+            content=ft.Icon(ft.Icons.CARD_GIFTCARD, size=64, color="white"), width=120, height=120,
+            border_radius=34, alignment=ft.alignment.center, rotate=0, scale=1.0,
+            animate_rotation=ft.Animation(130, "easeInOut"), animate_scale=ft.Animation(130, "easeInOut"),
+            gradient=ft.LinearGradient(begin=ft.alignment.top_left, end=ft.alignment.bottom_right, colors=[B1, B2]),
+            shadow=[ft.BoxShadow(blur_radius=30, color=GLOW, offset=ft.Offset(0, 8))])
+        dlg = dialog(title_text,
+                     ft.Column([ft.Row([box], alignment=ft.MainAxisAlignment.CENTER),
+                                ft.Row([muted("Abriendo…", 14)], alignment=ft.MainAxisAlignment.CENTER)],
+                               tight=True, width=320, spacing=14), [])
+
+        def ok(_):
+            close_dlg(dlg)
+            render()
+
+        async def anim():
+            for i in range(10):
+                box.rotate = 0.14 if i % 2 == 0 else -0.14
+                box.scale = 1.0 + i * 0.05
+                if i >= 6:
+                    box.gradient = ft.LinearGradient(begin=ft.alignment.top_left, end=ft.alignment.bottom_right,
+                                                     colors=[g1, g2])
+                page.update()
+                await asyncio.sleep(0.14)
+            box.rotate = 0
+            box.scale = 1.4
+            page.update()
+            await asyncio.sleep(0.2)
+            dlg.content = ft.Column([chest_banner(rar, sub), *reveal], tight=True, width=320, spacing=12,
+                                    horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                                    scroll=ft.ScrollMode.AUTO)
+            dlg.actions = [gbtn(btn_label, on_click=ok, height=42)]
+            page.update()
+
+        open_dlg(dlg)
+        page.run_task(anim)
+
+    def open_chest(n, sid):
+        rar = roll_rarity(n)
+        mission = random.choice(MISSIONS[rar])
         mine = (db.get("my_reward") or "").strip()
-        db.open_chest(n, mission, mine or random.choice(REWARDS))
+        if mine:  # tu recompensa personal manda; los cofres épicos y legendarios añaden un bonus
+            reward = mine + (f"\n\n{random.choice(BONUS[rar])}" if rar in BONUS else "")
+        else:
+            reward = random.choice(REWARDS[rar])
+        owned = {r["badge"] for r in db.chest_rows() if r["badge"]}
+        badge = random.choice([b for b in BADGES[rar] if b not in owned] or BADGES[rar])
+        db.open_chest(sid, n, mission, reward, rar, badge)
+        play_chest(f"¡Cofre del día {n * CHEST_EVERY}!", rar, f"Insignia: {badge}",
+                   [muted("Tu misión:"),
+                    ft.Text(mission, size=17, weight=ft.FontWeight.BOLD, color=TXT, text_align=ft.TextAlign.CENTER),
+                    muted("Cúmplela y se revela tu recompensa.")], "Aceptar")
 
-        def ok(_):
-            close_dlg(dlg)
-            render()
-
-        dlg = dialog(f"¡Cofre del día {n * CHEST_EVERY}!",
-                     ft.Column([muted("Te lo has ganado. Tu misión:"),
-                                ft.Text(mission, size=17, weight=ft.FontWeight.BOLD, color=TXT),
-                                muted("Cúmplela y se revela tu recompensa.")], tight=True, width=320, spacing=10),
-                     [gbtn("Aceptar", on_click=ok, height=42)])
-        open_dlg(dlg)
-
-    def finish_chest(n):
-        r = db.chests()[n]
-        db.finish_chest(n)
-
-        def ok(_):
-            close_dlg(dlg)
-            render()
-
-        dlg = dialog("¡Misión cumplida!",
-                     ft.Column([muted("Tu recompensa:"),
-                                ft.Text(r["reward"], size=17, weight=ft.FontWeight.BOLD, color=OK),
-                                muted("Disfrútala sin culpa. Es tuya.")], tight=True, width=320, spacing=10),
-                     [gbtn("Genial", on_click=ok, height=42)])
-        open_dlg(dlg)
+    def finish_chest(n, sid):
+        r = next(x for x in db.chest_rows() if x["streak_id"] == sid and x["n"] == n)
+        db.finish_chest(sid, n)
+        rar = r["rarity"] or "Común"
+        play_chest("¡Misión cumplida!", rar, f"Insignia conseguida: {r['badge']}" if r["badge"] else "",
+                   [muted("Tu recompensa:"),
+                    ft.Text(r["reward"] or "", size=18, weight=ft.FontWeight.BOLD, color=RARITY_COLOR[rar],
+                            text_align=ft.TextAlign.CENTER),
+                    muted("Disfrútala sin culpa. Es tuya.")], "Genial")
 
     def chest_card():
-        kind, n, r, total = chest_status()
+        st = chest_status()
+        kind, n, r = st["kind"], st["n"], st["row"]
         target = n * CHEST_EVERY
+        cur = db.current_streak()
         if kind == "ready":
+            old = bool(r) and cur is not None and r["streak_id"] != cur["id"]
             return card(ft.Row([
                 ft.Icon(ft.Icons.CARD_GIFTCARD, color=WARN, size=30),
-                ft.Column([title(f"Cofre del día {target}", 16), muted("Está listo para abrir", 12)],
-                          spacing=0, expand=True),
-                gbtn("Abrir", on_click=lambda e: open_chest(n), height=40)], spacing=12))
+                ft.Column([title(f"Cofre del día {target}", 16),
+                           muted("Ganado en una racha anterior · listo para abrir" if old
+                                 else "Está listo para abrir", 12)], spacing=0, expand=True),
+                gbtn("Abrir", on_click=lambda e: open_chest(n, st["sid"]), height=40)], spacing=12))
         if kind == "active":
+            rar = r["rarity"] or "Común"
             return card(ft.Column([
-                ft.Row([ft.Icon(ft.Icons.CARD_GIFTCARD, color=WARN, size=24), title(f"Cofre del día {target}", 16)],
-                       spacing=10),
+                ft.Row([ft.Icon(ft.Icons.AUTO_AWESOME, color=RARITY_COLOR[rar], size=24),
+                        title(f"Cofre {rar} · día {target}", 16)], spacing=10),
                 muted("Tu misión", 12),
-                ft.Text(r["mission"], color=TXT, size=15),
+                ft.Text(r["mission"] or "", color=TXT, size=15),
+                muted(f"Insignia en juego: {r['badge']}" if r["badge"] else "", 12),
                 muted("Recompensa: sorpresa hasta que la cumplas", 12),
-                gbtn("Misión cumplida", ft.Icons.CHECK, on_click=lambda e: finish_chest(n), expand=True, height=46),
+                gbtn("Misión cumplida", ft.Icons.CHECK, on_click=lambda e: finish_chest(n, st["sid"]),
+                     expand=True, height=46),
             ], spacing=8))
-        left = target - total
+        left = target - st["days"]
+        frac = max(0.0, min(1.0, (st["days_f"] - (n - 1) * CHEST_EVERY) / CHEST_EVERY))
         return card(ft.Column([
             ft.Row([ft.Icon(ft.Icons.CARD_GIFTCARD, color=MUT, size=22),
                     ft.Text(f"Próximo cofre en {left} {'día' if left == 1 else 'días'}", color=TXT, expand=True)],
                    spacing=10),
-            ft.ProgressBar(value=1 - left / CHEST_EVERY, color=B1, bgcolor=CARD_IN, bar_height=8, border_radius=4),
+            ft.ProgressBar(value=frac, color=B1, bgcolor=CARD_IN, bar_height=8, border_radius=4),
         ], spacing=10))
 
     def home_view():
@@ -606,6 +928,7 @@ def main(page: ft.Page):
             f"Próximo hito: {nxt[1]} · faltan {human(nxt[0] * 86400 - secs)}" if nxt else "¡Has superado todos los hitos!",
             size=13, color="#DDE8FF", text_align=ft.TextAlign.CENTER)
         refs["start"] = start
+        refs["d0"] = d
 
         ring = ft.Stack([
             refs["ring"],
@@ -669,7 +992,7 @@ def main(page: ft.Page):
             ft.Row([stat("Días limpios totales", str(db.total_clean_days()), ft.Icons.CHECK_CIRCLE),
                     stat("Ganas superadas", str(db.count_events("urge")), ft.Icons.SHIELD)], spacing=14),
             ft.Row([stat("Recaídas", str(db.count_events("relapse")), ft.Icons.REPLAY),
-                    stat("Récord runner", f"{db.best_score('runner')} m", ft.Icons.DIRECTIONS_RUN)], spacing=14),
+                    stat("Retos superados", str(db.count_retos_done()), ft.Icons.BOLT)], spacing=14),
         ], spacing=14)
 
         def mrow(n, name):
@@ -684,13 +1007,22 @@ def main(page: ft.Page):
 
         hitos = card(ft.Column([title("Hitos", 17)] + [mrow(n, name) for n, name in MILESTONES], spacing=10))
 
-        ch = db.chests()
-        chest_rows = [ft.Row([
-            ft.Icon(ft.Icons.CARD_GIFTCARD, size=18, color=OK if ch[n]["done_ts"] else WARN),
-            ft.Text(f"Día {n * CHEST_EVERY}", color=TXT, expand=True),
-            muted("Cumplida" if ch[n]["done_ts"] else "Pendiente", 12)], spacing=12) for n in sorted(ch)]
-        chests_card = card(ft.Column([title("Cofres de 10 días", 17)] + (
-            chest_rows or [muted("Tu primer cofre llega a los 10 días limpios.")]), spacing=10))
+        ch = [r for r in db.chest_rows() if r["opened_ts"]]
+
+        def chest_line(r):
+            rar = r["rarity"] or "Común"
+            col = RARITY_COLOR[rar]
+            hecho = bool(r["done_ts"])
+            return ft.Row([
+                ft.Icon(ft.Icons.EMOJI_EVENTS if hecho else ft.Icons.CARD_GIFTCARD, size=20, color=col),
+                ft.Column([ft.Text(r["badge"] or "Cofre", color=TXT, weight=ft.FontWeight.W_600),
+                           ft.Text(f"{rar} · cofre del día {r['n'] * CHEST_EVERY}", size=11, color=col)],
+                          spacing=0, expand=True),
+                muted("Cumplida" if hecho else "Pendiente", 12)], spacing=12)
+
+        chests_card = card(ft.Column([title("Tu colección de cofres", 17)] + (
+            [chest_line(r) for r in reversed(ch)] or [muted("Tu primer cofre llega a los 10 días de racha.")]),
+            spacing=10))
 
         score, level, color, hist, why = risk_info(db)
         mx = max(hist) or 1
@@ -842,7 +1174,7 @@ def main(page: ft.Page):
                                  on_click=lambda e: start_date_dialog())], spacing=12)),
             card(ft.Column([
                 title("Recompensas", 17),
-                muted("Si escribes una, saldrá en tus cofres. Si no, te sorprenderá una de la app."),
+                muted("Si escribes una, saldrá en tus cofres (los épicos y legendarios añaden un bonus). Si no, te sorprenderá una de la app según la rareza del cofre."),
                 my_reward,
                 sbtn("Guardar recompensa", ft.Icons.SAVE, on_click=save_reward, expand=True),
             ], spacing=12)),
@@ -858,20 +1190,58 @@ def main(page: ft.Page):
             ft.Container(height=100),
         ], spacing=16, scroll=ft.ScrollMode.AUTO))
 
-    # ---- SOS --------------------------------------------------------------
+    # ---- SOS: un reto de Gemini para distraerte --------------------------------
     def sos_view():
         reasons = [r["text"] for r in db.notes("reason")]
         plans = [r["text"] for r in db.notes("plan")]
+        tid = state["task"]
+        cur = {"id": None, "loading": False}
 
-        def option(icon, label, sub, target):
-            return card(ft.Row([
-                ft.Container(content=ft.Icon(icon, color="white", size=26), width=52, height=52, border_radius=16,
-                             gradient=GRAD, alignment=ft.alignment.center,
-                             shadow=[ft.BoxShadow(blur_radius=14, color=GLOW, offset=ft.Offset(0, 5))]),
-                ft.Column([ft.Text(label, weight=ft.FontWeight.BOLD, color=TXT, size=16), muted(sub, 12)],
-                          spacing=0, expand=True),
-                ft.Icon(ft.Icons.CHEVRON_RIGHT, color=MUT)], spacing=14),
-                on_click=lambda e: go(target), ink=True)
+        spin = ft.Row([ft.ProgressRing(width=22, height=22, stroke_width=3, color=B1),
+                       muted("Buscando un reto para ti…", 14)], spacing=12)
+        reto_tipo = ft.Text("", size=12, weight=ft.FontWeight.BOLD, color=B1)
+        reto_t = ft.Text("", size=21, weight=ft.FontWeight.BOLD, color=TXT)
+        reto_src = muted("", 11)
+        reto_card = card(ft.Column([
+            ft.Row([ft.Icon(ft.Icons.BOLT, color=WARN, size=22), title("Tu reto", 16)], spacing=8),
+            spin, reto_tipo, reto_t, reto_src], spacing=10))
+
+        async def cargar():
+            await asyncio.sleep(0.05)
+            if cur["loading"]:
+                return
+            cur["loading"] = True
+            cur["id"] = None
+            spin.visible = True
+            reto_t.value = reto_tipo.value = reto_src.value = ""
+            page.update()
+            try:
+                texto, tipo, origen = await asyncio.to_thread(generar_reto, db)
+                if state["task"] != tid:  # ya te has ido de la pantalla: no se gasta el reto
+                    return
+                cur["id"] = await asyncio.to_thread(db.add_reto, texto, tipo)
+                reto_t.value = texto
+                reto_tipo.value = tipo.upper()
+                reto_src.value = "" if origen == "ia" else "Reto de reserva (no se pudo contactar con la IA)"
+            except Exception as ex:
+                print(f"Error mostrando reto: {ex}")
+                reto_t.value = random.choice(URGE_PLAN)
+            finally:
+                cur["loading"] = False
+                if state["task"] == tid:
+                    spin.visible = False
+                    page.update()
+
+        def otro(e):
+            if not cur["loading"]:
+                page.run_task(cargar)
+
+        def hecho(e):
+            if cur["loading"]:
+                return
+            if cur["id"]:
+                db.finish_reto(cur["id"])
+            survived_dialog()
 
         reason_card = card(ft.Column([
             ft.Text("Recuerda por qué lo haces", weight=ft.FontWeight.BOLD, color=TXT),
@@ -882,400 +1252,16 @@ def main(page: ft.Page):
         plan_card = card(ft.Column([ft.Text("Tu plan" if plans else "Haz esto ahora", weight=ft.FontWeight.BOLD,
                                             color=TXT),
                                     *[ft.Text("• " + p, size=14, color=MUT) for p in plan_items[:5]]], spacing=6))
+        page.run_task(cargar)
         return padded(ft.Column([
             ft.Container(height=14),
             back_bar("Aquí estoy contigo"),
-            muted("Las ganas son una ola: suben, llegan a un pico y bajan solas. Elige algo para cruzarla.", 14),
-            option(ft.Icons.DIRECTIONS_RUN, "Runner", "Corre, esquiva y supera tu récord de metros", "runner"),
-            option(ft.Icons.AIR, "Respirar", "Ciclo guiado 4-7-8", "breath"),
-            option(ft.Icons.TIMER, "Surfear la ola", "10 minutos de cuenta atrás", "wave"),
+            muted("Las ganas suben, llegan a un pico y bajan solas. Ocupa la mente con esto mientras pasan.", 14),
+            reto_card,
+            gbtn("Reto cumplido", ft.Icons.CHECK, on_click=hecho, expand=True, height=54),
+            sbtn("Otro reto", ft.Icons.REFRESH, on_click=otro, expand=True),
             reason_card, plan_card,
-            gbtn("Lo he superado", ft.Icons.CHECK, on_click=survived_dialog, expand=True, height=54),
             ft.TextButton("He recaído", on_click=relapse_dialog),
-            ft.Container(height=20),
-        ], spacing=14, scroll=ft.ScrollMode.AUTO))
-
-    def breath_view():
-        circle = ft.Container(width=120, height=120, border_radius=200, gradient=GRAD,
-                              animate=ft.Animation(1000, "easeInOut"), alignment=ft.alignment.center,
-                              shadow=[ft.BoxShadow(blur_radius=40, color=GLOW, offset=ft.Offset(0, 0))])
-        label = ft.Text("Prepárate…", size=26, weight=ft.FontWeight.BOLD, color=TXT)
-        counter = muted("", 16)
-        tid = state["task"]
-
-        async def run():
-            await asyncio.sleep(1)
-            for cycle in range(4):
-                for name, secs, size in (("Inhala", 4, 220), ("Mantén", 7, 220), ("Exhala", 8, 100)):
-                    if state["task"] != tid:
-                        return
-                    label.value = name
-                    circle.animate = ft.Animation(secs * 1000 if name != "Mantén" else 200, "easeInOut")
-                    circle.width = circle.height = size
-                    for t in range(secs, 0, -1):
-                        if state["task"] != tid:
-                            return
-                        counter.value = f"{t}   ·   ciclo {cycle + 1}/4"
-                        page.update()
-                        await asyncio.sleep(1)
-            label.value = "¿Cómo te sientes?"
-            counter.value = ""
-            page.update()
-
-        page.run_task(run)
-        return padded(ft.Column([
-            ft.Container(height=14), back_bar("Respirar"), ft.Container(height=30),
-            ft.Row([ft.Container(circle, width=240, height=240, alignment=ft.alignment.center)],
-                   alignment=ft.MainAxisAlignment.CENTER),
-            ft.Row([label], alignment=ft.MainAxisAlignment.CENTER),
-            ft.Row([counter], alignment=ft.MainAxisAlignment.CENTER),
-            ft.Container(height=20),
-            gbtn("Lo he superado", ft.Icons.CHECK, on_click=survived_dialog, expand=True),
-        ], expand=True))
-
-    def wave_view():
-        total = 600
-        txt = ft.Text("10:00", size=60, weight=ft.FontWeight.BOLD, color=TXT)
-        msg = ft.Text("Observa la sensación sin actuar. Pasará.", text_align=ft.TextAlign.CENTER, color=MUT)
-        bar = ft.ProgressBar(value=0, color=B1, bgcolor=CARD_IN, bar_height=10, border_radius=5)
-        tid = state["task"]
-        tips = {60: "Primer minuto superado. Sigue respirando lento.",
-                180: "Las ganas suelen estar cerca del pico. Aguanta.",
-                360: "Ya deberían empezar a bajar.",
-                540: "Casi está. Lo estás logrando."}
-
-        async def run():
-            for left in range(total, -1, -1):
-                if state["task"] != tid:
-                    return
-                m, s = divmod(left, 60)
-                txt.value = f"{m:02d}:{s:02d}"
-                bar.value = 1 - left / total
-                if (total - left) in tips:
-                    msg.value = tips[total - left]
-                page.update()
-                await asyncio.sleep(1)
-            msg.value = "¡Ola superada! Tú has ganado."
-            page.update()
-
-        page.run_task(run)
-        return padded(ft.Column([
-            ft.Container(height=14), back_bar("Surfear la ola"), ft.Container(height=20),
-            card(ft.Column([ft.Row([txt], alignment=ft.MainAxisAlignment.CENTER), bar, ft.Container(msg, padding=10)],
-                           spacing=14)),
-            gbtn("Lo he superado", ft.Icons.CHECK, on_click=survived_dialog, expand=True),
-        ], spacing=20, expand=True))
-
-    # ---- RUNNER -----------------------------------------------------------
-    def runner_view():
-        W = int(min((page.width or 380) - 32, 440))
-        H = 260
-        GROUND = H - 46
-        PX = int(W * 0.2)
-        GRAV, JUMP_V = 2300.0, 790.0
-        PPM = 40.0  # píxeles por metro
-        tid = state["task"]
-        best = db.best_score("runner")
-        g = {"mode": "ready", "y": 0.0, "vy": 0.0, "slide": 0.0, "queued": False, "jbuf": 0.0, "dist": 0.0,
-             "obs": [], "spawn_in": W * 0.7, "bg": 0.0, "drag": 0.0, "flash": 0.0, "last100": 0, "meters": 0}
-        city = [(random.randint(26, 54), random.randint(40, 110)) for _ in range(14)]
-        city_w = sum(w + 6 for w, _ in city)
-
-        def fill(color):
-            return ft.Paint(color=color, style=ft.PaintingStyle.FILL)
-
-        def stroke(color, width):
-            return ft.Paint(color=color, stroke_width=width, style=ft.PaintingStyle.STROKE,
-                            stroke_cap=ft.StrokeCap.ROUND)
-
-        P_SKY, P_GROUND = fill("#22345F"), fill("#101624")
-        P_LINE, P_DASH = stroke(B1, 2.5), stroke("#2A3550", 3)
-        P_OBS, P_OBS_EDGE = fill(CORAL), stroke("#FFB3BF", 3)
-        P_BODY, P_HEAD = stroke("#FFFFFF", 4.5), fill("#FFFFFF")
-
-        canvas = fcv.Canvas(shapes=[], width=W, height=H)
-        meters_t = ft.Text("0 m", size=40, weight=ft.FontWeight.BOLD, color=TXT)
-        level_t = muted("Nivel 1", 14, B1)
-        record_t = muted(f"Récord: {best} m", 14)
-        flash_t = ft.Text("", size=18, weight=ft.FontWeight.BOLD, color=WARN)
-        ov_title = ft.Text("Toca para empezar", size=22, weight=ft.FontWeight.BOLD, color="white",
-                           text_align=ft.TextAlign.CENTER)
-        ov_sub = ft.Text("Salta los obstáculos del suelo y deslízate bajo las barreras colgantes.", size=13,
-                         color="#DDE8FF", text_align=ft.TextAlign.CENTER)
-        overlay = ft.Container(
-            content=ft.Column([ov_title, ov_sub], horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                              alignment=ft.MainAxisAlignment.CENTER, spacing=8),
-            width=W, height=H, alignment=ft.alignment.center, bgcolor="#99101624", padding=24)
-
-        # --- obstáculos -----------------------------------------------------
-        def make_obstacle(m, speed):
-            pool = [("box", 6)]
-            if m >= 14: pool.append(("bar", 5))
-            if m >= 40: pool.append(("tall", 4))
-            if m >= 75: pool.append(("double", 4))
-            if m >= 110: pool.append(("combo", 4))
-            if m >= 150: pool.append(("lowbar", 4))
-            kind = random.choice([k for k, w in pool for _ in range(w)])
-            if kind == "box":
-                parts = [(0, 28, 0, 36)]
-            elif kind == "tall":
-                parts = [(0, 30, 0, 58)]
-            elif kind == "double":
-                parts = [(0, 26, 0, 36), (54, 26, 0, 36)]
-            elif kind == "bar":
-                parts = [(0, 76, 36, 999)]
-            elif kind == "lowbar":
-                parts = [(0, 86, 29, 999)]
-            else:  # combo: salto y luego deslizamiento
-                parts = [(0, 28, 0, 36), (int(speed * 0.95) + 50, 76, 36, 999)]
-            return {"x": W + 40.0, "parts": parts, "w": max(p[0] + p[1] for p in parts)}
-
-        # --- dibujo ---------------------------------------------------------
-        def pose_shapes():
-            sliding = g["slide"] > 0 and g["y"] <= 0
-            base = GROUND - g["y"]
-            ph = g["dist"] / 14.0
-            px = PX
-            L = []
-            if sliding:
-                hip, sh = (px + 6, base - 10), (px - 16, base - 14)
-                L.append(fcv.Circle(px - 24, base - 19, 8, P_HEAD))
-                L.append(fcv.Line(sh[0], sh[1], hip[0], hip[1], P_BODY))
-                L.append(fcv.Line(hip[0], hip[1], px + 32, base - 4, P_BODY))
-                L.append(fcv.Line(hip[0], hip[1], px + 30, base - 11, P_BODY))
-                L.append(fcv.Line(sh[0], sh[1], px - 34, base - 6, P_BODY))
-            elif g["y"] > 0 or g["vy"] > 0:  # en el aire
-                hip, sh = (px, base - 26), (px + 3, base - 46)
-                L.append(fcv.Circle(px + 5, base - 54, 8, P_HEAD))
-                L.append(fcv.Line(sh[0], sh[1], hip[0], hip[1], P_BODY))
-                L.append(fcv.Line(hip[0], hip[1], px + 14, base - 14, P_BODY))
-                L.append(fcv.Line(hip[0], hip[1], px - 6, base - 8, P_BODY))
-                L.append(fcv.Line(sh[0], sh[1], px + 16, base - 62, P_BODY))
-                L.append(fcv.Line(sh[0], sh[1], px - 6, base - 58, P_BODY))
-            else:  # corriendo
-                hip, sh = (px, base - 26), (px + 3, base - 47)
-                L.append(fcv.Circle(px + 5, base - 55, 8, P_HEAD))
-                L.append(fcv.Line(sh[0], sh[1], hip[0], hip[1], P_BODY))
-                for k in (0.0, math.pi):
-                    a = ph + k
-                    foot = (px + math.sin(a) * 16, base - max(0.0, math.cos(a)) * 9)
-                    L.append(fcv.Line(hip[0], hip[1], foot[0], foot[1], P_BODY))
-                    hand = (sh[0] + math.sin(a + math.pi) * 13, sh[1] + 14 - abs(math.cos(a)) * 2)
-                    L.append(fcv.Line(sh[0], sh[1], hand[0], hand[1], P_BODY))
-            return L
-
-        def build_shapes():
-            S = []
-            # skyline con parallax
-            off = (g["bg"] * 0.2) % city_w
-            x = -off
-            while x < W:
-                for w, h in city:
-                    if x + w > 0 and x < W:
-                        S.append(fcv.Rect(x, GROUND - h, w, h, paint=P_SKY, border_radius=4))
-                    x += w + 6
-            # suelo
-            S.append(fcv.Rect(0, GROUND, W, H - GROUND, paint=P_GROUND))
-            S.append(fcv.Line(0, GROUND, W, GROUND, P_LINE))
-            dx = -(g["dist"] % 44)
-            while dx < W:
-                S.append(fcv.Line(dx, GROUND + 16, dx + 20, GROUND + 16, P_DASH))
-                dx += 44
-            # obstáculos
-            for o in g["obs"]:
-                for pdx, w, hlo, hhi in o["parts"]:
-                    top = GROUND - min(hhi, GROUND)
-                    bottom = GROUND - hlo
-                    S.append(fcv.Rect(o["x"] + pdx, top, w, bottom - top, paint=P_OBS, border_radius=6))
-                    if hhi >= 999:
-                        S.append(fcv.Line(o["x"] + pdx + 3, bottom - 1, o["x"] + pdx + w - 3, bottom - 1, P_OBS_EDGE))
-                    else:
-                        S.append(fcv.Line(o["x"] + pdx + 4, top + 2, o["x"] + pdx + w - 4, top + 2, P_OBS_EDGE))
-            S.extend(pose_shapes())
-            return S
-
-        def draw(update=True):
-            canvas.shapes = build_shapes()
-            if update:
-                canvas.update()
-
-        # --- lógica ---------------------------------------------------------
-        def crashed():
-            sliding = g["slide"] > 0 and g["y"] <= 0
-            x0, x1 = (PX - 22, PX + 28) if sliding else (PX - 8, PX + 8)
-            hb = g["y"]
-            ht = hb + (24 if sliding else 60)
-            for o in g["obs"]:
-                for pdx, w, hlo, hhi in o["parts"]:
-                    ox0 = o["x"] + pdx
-                    ox1 = ox0 + w
-                    if x0 + 3 < ox1 and x1 - 3 > ox0 and hb + 3 < hhi and ht - 3 > hlo:
-                        return True
-            return False
-
-        def step(dt):
-            m = g["dist"] / PPM
-            speed = 270 + min(m * 1.5, 450)  # la velocidad sube más despacio
-            g["dist"] += speed * dt
-            g["bg"] += speed * dt
-            g["jbuf"] = max(0.0, g["jbuf"] - dt)
-            if g["y"] > 0 or g["vy"] > 0:
-                g["y"] += g["vy"] * dt
-                g["vy"] -= GRAV * dt
-                if g["y"] <= 0:
-                    g["y"], g["vy"] = 0.0, 0.0
-                    if g["jbuf"] > 0:
-                        g["vy"] = JUMP_V
-                        g["jbuf"] = 0.0
-                    elif g["queued"]:
-                        g["slide"] = 0.6
-                        g["queued"] = False
-            elif g["slide"] > 0:
-                g["slide"] -= dt
-            for o in g["obs"]:
-                o["x"] -= speed * dt
-            g["obs"] = [o for o in g["obs"] if o["x"] + o["w"] > -30]
-            g["spawn_in"] -= speed * dt
-            if g["spawn_in"] <= 0:
-                o = make_obstacle(m, speed)
-                g["obs"].append(o)
-                react = max(0.68, 0.95 - m * 0.0025)  # huecos más cortos = más obstáculos
-                g["spawn_in"] = o["w"] + speed * react + random.uniform(0, speed * 0.30)
-            # HUD
-            meters = int(g["dist"] / PPM)
-            if meters != g["meters"]:
-                g["meters"] = meters
-                meters_t.value = f"{meters} m"
-                level_t.value = f"Nivel {meters // 40 + 1}"
-                meters_t.update()
-                level_t.update()
-                if meters // 100 > g["last100"]:
-                    g["last100"] = meters // 100
-                    g["flash"] = 1.2
-                    flash_t.value = f"¡{meters} m!"
-                    flash_t.update()
-            if g["flash"] > 0:
-                g["flash"] -= dt
-                if g["flash"] <= 0:
-                    flash_t.value = ""
-                    flash_t.update()
-            return crashed()
-
-        def finish():
-            nonlocal best
-            g["mode"] = "over"
-            m = int(g["dist"] / PPM)
-            if m > 0:
-                db.add_score("runner", m)
-            if m > best:
-                best = m
-                ov_title.value = f"¡NUEVO RÉCORD! {m} m"
-                ov_sub.value = "Has superado tu marca. Toca para intentarlo otra vez."
-            else:
-                ov_title.value = f"Has llegado a {m} m"
-                ov_sub.value = f"Te faltan {best - m + 1} m para superar tu récord ({best} m). Toca para reintentar."
-            record_t.value = f"Récord: {best} m"
-            overlay.visible = True
-            record_t.update()
-            overlay.update()
-
-        async def loop():
-            last = time.perf_counter()
-            while g["mode"] == "run" and state["task"] == tid:
-                now = time.perf_counter()
-                dt = min(0.05, now - last)
-                last = now
-                hit = step(dt)
-                draw()
-                if hit:
-                    finish()
-                    return
-                await asyncio.sleep(0.014)
-
-        def start():
-            g.update(mode="run", y=0.0, vy=0.0, slide=0.0, queued=False, jbuf=0.0, dist=0.0, obs=[],
-                     spawn_in=W * 0.7, last100=0, flash=0.0, meters=0, bg=0.0)
-            meters_t.value = "0 m"
-            level_t.value = "Nivel 1"
-            flash_t.value = ""
-            overlay.visible = False
-            page.update()
-            page.run_task(loop)
-
-        def act_jump(e=None):
-            if g["mode"] != "run":
-                start()
-                return
-            if g["y"] <= 0 and g["vy"] <= 0:
-                g["vy"] = JUMP_V
-                g["slide"] = 0.0
-            else:
-                g["jbuf"] = 0.12
-
-        def act_slide(e=None):
-            if g["mode"] != "run":
-                start()
-                return
-            if g["y"] <= 0 and g["vy"] <= 0:
-                g["slide"] = 0.6
-            else:
-                g["vy"] = min(g["vy"], -900.0)
-                g["queued"] = True
-
-        def on_key(e: ft.KeyboardEvent):
-            if e.key in ("Arrow Up", " ", "W"):
-                act_jump()
-            elif e.key in ("Arrow Down", "S"):
-                act_slide()
-
-        def on_drag_start(e):
-            g["drag"] = 0.0
-
-        def on_drag_update(e):
-            g["drag"] += getattr(e, "delta_y", 0) or 0
-            if g["drag"] > 25:
-                g["drag"] = -9999
-                act_slide()
-            elif g["drag"] < -25 and g["drag"] > -9000:
-                g["drag"] = -9999
-                act_jump()
-
-        page.on_keyboard_event = on_key
-        draw(update=False)
-
-        arena = ft.Container(
-            content=ft.Stack([canvas, overlay], width=W, height=H),
-            width=W, height=H, border_radius=26, clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
-            gradient=ft.LinearGradient(begin=ft.alignment.top_center, end=ft.alignment.bottom_center,
-                                       colors=["#141B2B", "#1E3B7A"]),
-            shadow=neu(22, 8))
-        gesture = ft.GestureDetector(content=arena, on_tap=act_jump, on_vertical_drag_start=on_drag_start,
-                                     on_vertical_drag_update=on_drag_update)
-
-        def ctrl(icon, label, handler, danger=False):
-            return ft.GestureDetector(
-                on_tap_down=handler, expand=True,
-                content=ft.Container(
-                    content=ft.Row([ft.Icon(icon, color="white", size=26),
-                                    ft.Text(label, color="white", weight=ft.FontWeight.BOLD, size=16)],
-                                   alignment=ft.MainAxisAlignment.CENTER, spacing=8),
-                    height=64, border_radius=20, alignment=ft.alignment.center,
-                    gradient=GRAD_DANGER if danger else GRAD,
-                    shadow=[ft.BoxShadow(blur_radius=22, color="#55E5484D" if danger else GLOW,
-                                         offset=ft.Offset(0, 8))]))
-
-        return padded(ft.Column([
-            ft.Container(height=14),
-            back_bar("Runner"),
-            ft.Row([ft.Column([meters_t, level_t], spacing=0),
-                    ft.Column([record_t, flash_t], spacing=2, horizontal_alignment=ft.CrossAxisAlignment.END)],
-                   alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
-            ft.Row([gesture], alignment=ft.MainAxisAlignment.CENTER),
-            ft.Row([ctrl(ft.Icons.KEYBOARD_ARROW_UP, "SALTAR", act_jump),
-                    ctrl(ft.Icons.KEYBOARD_ARROW_DOWN, "DESLIZAR", act_slide, danger=True)], spacing=14),
-            muted("Toca o desliza hacia arriba para saltar · desliza hacia abajo para agacharte. "
-                  "En PC: ↑ ↓ o espacio.", 12),
-            ft.TextButton("Ya me siento mejor", on_click=survived_dialog),
             ft.Container(height=20),
         ], spacing=14, scroll=ft.ScrollMode.AUTO))
 
@@ -1347,7 +1333,7 @@ def main(page: ft.Page):
                 layers.append(ft.Container(sos_pill(), right=18, bottom=96))
             page.add(ft.SafeArea(ft.Stack(layers, expand=True), expand=True))
         else:
-            body = {"sos": sos_view, "runner": runner_view, "breath": breath_view, "wave": wave_view}[scr]()
+            body = {"sos": sos_view}[scr]()
             page.add(ft.SafeArea(ft.Container(body, expand=True), expand=True))
         page.update()
 
@@ -1359,6 +1345,9 @@ def main(page: ft.Page):
                 if state["screen"] == "main" and state["tab"] == 0 and "days" in refs and not state["locked"]:
                     secs = (local_now() - refs["start"]).total_seconds()
                     d, h, m, s = split_duration(secs)
+                    if d != refs.get("d0"):  # ha cambiado el día: se refresca también la tarjeta del cofre
+                        render()
+                        continue
                     refs["days"].value = str(d)
                     refs["hms"].value = f"{h:02d}h {m:02d}m {s:02d}s"
                     days_f = secs / 86400
